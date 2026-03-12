@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "问卷星下载助手",
+  "version": "0.1",
+  "description": "自动检查问卷星是否有新提交",
+  "permissions": [
+    "storage",
+    "downloads"
+  ],
+  "host_permissions": [
+    "https://www.wjx.cn/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.wjx.cn/*"
+      ],
+      "js": [
+        "content.js"
+      ]
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "inject.js"
+      ],
+      "matches": [
+        "https://www.wjx.cn/*"
+      ]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
