@@ -35,3 +35,10 @@ Continue next survey
 Clone this repository:
 ```bash
 git clone https://github.com/YOUR_USERNAME/wjx-helper.git
+Or download the ZIP file.
+
+2 Open Chrome Extensions
+Go to: chrome://extensions/
+
+3 Enable Developer Mode
+Turn on Developer mode in the top-right corner.
