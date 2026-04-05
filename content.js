@@ -42,6 +42,54 @@ console.log(
   const normalize = (s) =>
     (s ?? "").replace(/\u3000/g, " ").replace(/\s+/g, " ").trim();
 
+  /***********************
+   * ✅ 关键修复：解决后台标签页降速问题 (基于 Background Service Worker 方案)
+   * 浏览器不仅会节流原生 setTimeout，在某些版本上甚至开始节流纯计算的 WebWorker。
+   * 这里将定时器委托给扩展自带的 Service Worker 处理，实现绝对稳定的“不降速”。
+   ***********************/
+  let fastTimerIdCounter = 0;
+  const activeTimers = new Set();
+
+  const fastSetTimeout = (cb, ms) => {
+    const id = ++fastTimerIdCounter;
+    activeTimers.add(id);
+
+    try {
+      chrome.runtime.sendMessage({ type: "SLEEP", ms: ms }, (response) => {
+        if (chrome.runtime.lastError) {
+          // 如果与 background.js 的通信断开 (比如插件刚安装/重载)，安全降级回原生
+          window.setTimeout(() => {
+            if (activeTimers.has(id)) {
+              activeTimers.delete(id);
+              cb();
+            }
+          }, ms);
+          return;
+        }
+        if (activeTimers.has(id)) {
+          activeTimers.delete(id);
+          cb();
+        }
+      });
+    } catch (e) {
+      window.setTimeout(() => {
+        if (activeTimers.has(id)) {
+          activeTimers.delete(id);
+          cb();
+        }
+      }, ms);
+    }
+    return id;
+  };
+
+  const fastClearTimeout = (id) => {
+    activeTimers.delete(id);
+  };
+
+  // 覆盖当前文件作用域内的 setTimeout / clearTimeout，现有代码自动加速
+  const setTimeout = fastSetTimeout;
+  const clearTimeout = fastClearTimeout;
+
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   /***********************
@@ -55,6 +103,7 @@ console.log(
     sessionStorage.removeItem(CUR_KEY);
     sessionStorage.removeItem(FAILED_KEY);
     sessionStorage.removeItem("wjx_last_searched");
+    sessionStorage.removeItem("wjx_has_downloaded");
     return tasks; // 返回解析后的数组供检查
   }
 
@@ -97,6 +146,7 @@ console.log(
     const idx = getIndex();
     const nextIdx = idx + 1;
     sessionStorage.removeItem(CUR_KEY);
+    sessionStorage.removeItem("wjx_has_downloaded");
     setIndex(nextIdx);
     return tasks[nextIdx] || null;
   }
@@ -112,6 +162,7 @@ console.log(
     sessionStorage.removeItem(LIST_URL_KEY);
     sessionStorage.removeItem(FAILED_KEY);
     sessionStorage.removeItem("wjx_last_searched");
+    sessionStorage.removeItem("wjx_has_downloaded");
 
     clearRunToken();
 
@@ -331,7 +382,6 @@ console.log(
         return { row: i, tdSel, el: a, text: normalize2(a.innerText || td.innerText) };
       };
 
-      let isFirstHit = true;
       const processRow = (i) => {
         if (i < 1) { resolve(false); return; }
 
@@ -342,8 +392,9 @@ console.log(
         const ok = normalize2(hit.text) === normalize2(STOP_TEXT);
 
         if (ok) {
-          if (!isFirstHit) {
-            log(`匹配到截止导出，在新标签页记录当前页面...`);
+          const hasDownloaded = sessionStorage.getItem("wjx_has_downloaded") === "1";
+          if (hasDownloaded) {
+            log(`匹配到截止导出，但在之前已经有过新下载，在新标签页记录当前页面...`);
             window.open(location.href + "#static", "_blank");
           } else {
             log(`第一次直接匹配到截止导出，跳过新标签页打开`);
@@ -351,7 +402,7 @@ console.log(
           resolve(true);
           return;
         }
-        isFirstHit = false;
+        sessionStorage.setItem("wjx_has_downloaded", "1");
 
         // else：点击详情 → 等弹窗 iframe 加载完 → 注入下载 → 等待 → 关闭弹窗 → 处理 i-1
         log(hit.text, STOP_TEXT);
@@ -374,8 +425,6 @@ console.log(
         // readyState 轮询会读到上一次关闭弹窗后遗留的旧 document（它仍是 "complete"），
         // 导致 inject.js 被注射进即将被导航替换的旧文档，5秒后静默消失。
         // load 事件只在 iframe 真正加载完新 URL 后触发，不会被旧状态欺骗。
-        const INJECT_DELAY = 5000; // inject.js 内部 5s 延迟
-
         // 给 Layui 500ms 时间创建/复用 iframe 并开始加载新 URL
         // （这段时间内 iframe 从旧 "complete" 变成新 "loading"，load 事件尚未触发）
         setTimeout(() => {
@@ -400,24 +449,25 @@ console.log(
               s.onload = function () { this.remove(); };
               (document.head || document.documentElement).appendChild(s);
             }
-            // inject.js 内部 10s + 1s 缓冲后关弹窗
+            // 留 3.5s 后关弹窗 (防止因数据量大、服务器生成文件慢导致下载被中断)
             setTimeout(() => {
               capturedLayer?.querySelector("span > a")?.click();
               log(`关闭弹窗（${capturedLayer?.id}），继续处理第 ${i - 1} 行`);
-              setTimeout(() => processRow(i - 1), 2000);
-            }, INJECT_DELAY + 5000);
+              // 关弹窗后，只需缓冲 0.5s 便可处理下一条
+              setTimeout(() => processRow(i - 1), 500);
+            }, 3500);
           };
 
           if (!popupIframe) {
-            log(`⚠️ 500ms 后仍找不到弹窗 iframe，回退：注射到主页面`);
+            log(`⚠️仍找不到弹窗 iframe，回退：注射到主页面`);
             const s = document.createElement("script");
             s.src = chrome.runtime.getURL("inject.js");
             s.onload = function () { this.remove(); };
             (document.head || document.documentElement).appendChild(s);
             setTimeout(() => {
               log(`关闭弹窗（未知），继续处理第 ${i - 1} 行`);
-              setTimeout(() => processRow(i - 1), 2000);
-            }, INJECT_DELAY + 1000);
+              setTimeout(() => processRow(i - 1), 500);
+            }, 3500);
             return;
           }
 
@@ -435,8 +485,8 @@ console.log(
             setTimeout(() => {
               capturedLayer?.querySelector("span > a")?.click();
               log(`关闭弹窗（${capturedLayer?.id || "未知"}），继续处理第 ${i - 1} 行`);
-              setTimeout(() => processRow(i - 1), 2000);
-            }, INJECT_DELAY + 1000);
+              setTimeout(() => processRow(i - 1), 500);
+            }, 3500);
           }, 20000);
 
           // 监听 load 事件（{once:true} 确保只触发一次）
@@ -446,9 +496,7 @@ console.log(
           }, { once: true });
 
         }, 500); // 给 Layui 500ms 启动 iframe 导航
-
       };
-
       setTimeout(() => processRow(100), 600);
     });
 
@@ -467,6 +515,23 @@ console.log(
           (f.requestSubmit ? f.requestSubmit() : f.submit());
           return;
         }
+      }
+
+      // 无论是在哪一页，如果最终【没有】遇到截止导出，但是这个过程中发生了【下载】行为
+      // 说明它把所有新记录都下完了，准备切任务前，应当补开一个新标签页
+      log(`[DEBUG] 进入收尾阶段。foundCutoff: ${foundCutoff}, isPage2: ${isPage2}`);
+      if (!foundCutoff) {
+        const rawHasDownloaded = sessionStorage.getItem("wjx_has_downloaded");
+        const hasDownloaded = rawHasDownloaded === "1";
+        log(`[DEBUG] 因为没有中途被截断(!foundCutoff)，检查是否有下载行为: wjx_has_downloaded=${rawHasDownloaded}`);
+        if (hasDownloaded) {
+          log(`🔥 数据已全部下完（未遇到截止导出），作为存底在新标签页记录当前页面...`);
+          window.open(location.href + "#static", "_blank");
+        } else {
+          log(`[DEBUG] ❌ 取消补开新页面：因为本次任务压根没有任何新数据被点击下载。`);
+        }
+      } else {
+        log(`[DEBUG] ❌ 取消补开新页面：因为找到了 cutoff（这说明中途碰到了红线，已经在遇到红线时处理过新标签页了）。`);
       }
 
       // 如果走到了这里说明该任务彻底完成：要么在第2页找到了截止导出；要么两页全部下载完了（没中截止导出）
@@ -497,7 +562,7 @@ console.log(
     const panel = document.createElement("div");
     panel.id = PANEL_ID;
     panel.style.cssText =
-      "position:fixed;right:16px;bottom:16px;z-index:999999;" +
+      "position:fixed;left:16px;bottom:16px;z-index:999999;" +
       "padding:12px;border-radius:8px;background:#fff;" +
       "box-shadow:0 4px 12px rgba(0,0,0,0.2);border:1px solid #ddd;" +
       "display:flex;flex-direction:column;gap:8px;width:200px;";

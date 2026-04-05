@@ -16,3 +16,13 @@ chrome.action.onClicked.addListener((tab) => {
     }
   });
 });
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === "SLEEP") {
+    // Service Worker 的 setTimeout 不受前台标签页的后台休眠降速影响
+    setTimeout(() => {
+      sendResponse({ done: true });
+    }, request.ms);
+    return true; // 保持通信通道异步返回
+  }
+});
