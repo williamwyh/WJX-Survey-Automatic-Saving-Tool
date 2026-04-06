@@ -1,3 +1,4 @@
+// 截止导出版本final
 console.log(
   "%c【问卷星助手】已加载",
   "color:red;font-size:16px;font-weight:bold;"
@@ -7,509 +8,386 @@ console.log(
   const TAG = "【问卷星助手】";
   const log = (...a) => console.log(TAG, ...a);
 
-  /***********************
-   * ✅ 关键修复：防止新标签页（用来检查错误的）自动跑脚本
-   * 如果 URL 里带有 #static，则完全不执行任何逻辑，安静呆着
-   ***********************/
   if (location.hash === "#static") {
     log("🛑 检测到 #static 标记，脚本已暂停（静态模式，仅供检查）");
     return;
   }
 
-  /***********************
-   * ✅ 硬闸门：只有点过“开始全部任务”才允许运行
-   * 用 localStorage，保证新开标签页也能读到同一个授权状态
-   ***********************/
-  const RUN_TOKEN_KEY = "wjx_run_token_v1";
-  const hasRunToken = () => localStorage.getItem(RUN_TOKEN_KEY) === "1";
-  const setRunToken = () => localStorage.setItem(RUN_TOKEN_KEY, "1");
-  const clearRunToken = () => localStorage.removeItem(RUN_TOKEN_KEY);
+  // ==========================================
+  // 1. 核心工具类 (Utils)
+  // ==========================================
+  const Utils = {
+    normalizeString(s) { // 规范化字符串（统一小写，忽略大小写差异）
+      return (s ?? "").replace(/\u3000/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
+    },
+    setNativeValue(el, value) { // 强制设置输入框的值
+      const proto = Object.getPrototypeOf(el);
+      const desc = Object.getOwnPropertyDescriptor(proto, "value");
+      if (desc?.set) desc.set.call(el, value);
+      else el.value = value;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+  };
 
-  // ✅ 新增：用户输入的 Task List 存储 Key
-  const USER_TASKS_KEY = "wjx_user_defined_tasks";
-
-  // ✅ 宽松匹配列表页 URL
-  const isListPage = () => /myquestionnaires/i.test(location.href);
-
-  const TASK_KEY = "wjx_tasks";
-  const INDEX_KEY = "wjx_task_index";
-  const CUR_KEY = "wjx_current_task";
-  const LIST_URL_KEY = "wjx_list_url";
-  const AUTO_KEY = "wjx_auto_run_all";
-  const RUNNING_KEY = "__wjx_multi_running";
-  const FAILED_KEY = "wjx_failed";
-
-  const normalize = (s) =>
-    (s ?? "").replace(/\u3000/g, " ").replace(/\s+/g, " ").trim();
-
-  /***********************
-   * ✅ 关键修复：解决后台标签页降速问题 (基于 Background Service Worker 方案)
-   * 浏览器不仅会节流原生 setTimeout，在某些版本上甚至开始节流纯计算的 WebWorker。
-   * 这里将定时器委托给扩展自带的 Service Worker 处理，实现绝对稳定的“不降速”。
-   ***********************/
+  // 背景定时器加速 (委托给 background.js 处理)
   let fastTimerIdCounter = 0;
   const activeTimers = new Set();
-
   const fastSetTimeout = (cb, ms) => {
     const id = ++fastTimerIdCounter;
     activeTimers.add(id);
-
     try {
       chrome.runtime.sendMessage({ type: "SLEEP", ms: ms }, (response) => {
         if (chrome.runtime.lastError) {
-          // 如果与 background.js 的通信断开 (比如插件刚安装/重载)，安全降级回原生
-          window.setTimeout(() => {
-            if (activeTimers.has(id)) {
-              activeTimers.delete(id);
-              cb();
-            }
-          }, ms);
+          window.setTimeout(() => { if (activeTimers.has(id)) { activeTimers.delete(id); cb(); } }, ms);
           return;
         }
-        if (activeTimers.has(id)) {
-          activeTimers.delete(id);
-          cb();
-        }
+        if (activeTimers.has(id)) { activeTimers.delete(id); cb(); }
       });
     } catch (e) {
-      window.setTimeout(() => {
-        if (activeTimers.has(id)) {
-          activeTimers.delete(id);
-          cb();
-        }
-      }, ms);
+      window.setTimeout(() => { if (activeTimers.has(id)) { activeTimers.delete(id); cb(); } }, ms);
     }
     return id;
   };
-
-  const fastClearTimeout = (id) => {
-    activeTimers.delete(id);
-  };
-
-  // 覆盖当前文件作用域内的 setTimeout / clearTimeout，现有代码自动加速
+  const fastClearTimeout = (id) => activeTimers.delete(id);
   const setTimeout = fastSetTimeout;
   const clearTimeout = fastClearTimeout;
-
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  /***********************
-   * ✅ 队列管理
-   ***********************/
-  // 修改：从传入的 rawText 中解析任务，不再依赖全局 TASKS_TEXT
-  function initTasksFromInput(rawText) {
-    const tasks = rawText.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
-    sessionStorage.setItem(TASK_KEY, JSON.stringify(tasks));
-    sessionStorage.setItem(INDEX_KEY, "0");
-    sessionStorage.removeItem(CUR_KEY);
-    sessionStorage.removeItem(FAILED_KEY);
-    sessionStorage.removeItem("wjx_last_searched");
-    sessionStorage.removeItem("wjx_has_downloaded");
-    return tasks; // 返回解析后的数组供检查
-  }
+  // ==========================================
+  // 2. 状态管理 (Store)
+  // 集中管理 localStorage 与 sessionStorage
+  // ==========================================
+  const KEYS = {
+    RUN_TOKEN: "wjx_run_token", // 【持久化】总开关，只要它为 1，哪怕重启浏览器也会继续跑
+    USER_TASKS: "wjx_user_defined_tasks", // 【持久化】用户初始输入的全部任务名单
+    TASK: "wjx_tasks", // 【暂存】当前正在跑的任务数组（解析后的列表）
+    INDEX: "wjx_task_index", // 【暂存】当前进度跑到数组的第几个了
+    CUR: "wjx_current_task", // 【暂存】当前正在死磕的任务名字（防止网页刷新丢失目标）
+    LIST_URL: "wjx_list_url", // 【暂存】干完活后需要回退回去的列表真网址
+    AUTO: "wjx_auto_run_all",
+    FAILED: "wjx_failed", // 【暂存】装满没找到或失败的任务黑名单
+    SUCCESS: "wjx_success", // 【暂存】装满成功下载的任务列表
+    LAST_SEARCHED: "wjx_last_searched",
+    HAS_DOWNLOADED: "wjx_has_downloaded", // 【暂存】标记这一单到底有没有下过东西
+    // 页面跳转状态机（在详情页疯狂刷新时用来当作“接力棒”）
+    NEED_100: "wjx_need_100", // 挂档 1：是否需要改 100 条
+    NEED_LAST_PAGE: "wjx_need_last_page", // 挂档 2：是否需要翻到最后一页
+    NEED_DOWNLOAD: "wjx_need_download" // 挂档 3：前面搞定了，正式进入表单爬取和下载
+  };
 
-  function recordFail(t) {
-    let arr = JSON.parse(sessionStorage.getItem(FAILED_KEY) || "[]");
-    if (!arr.includes(t)) arr.push(t);
-    sessionStorage.setItem(FAILED_KEY, JSON.stringify(arr));
-  }
+  const Store = {
+    get hasRunToken() { return localStorage.getItem(KEYS.RUN_TOKEN) === "1"; },
+    setRunToken() { localStorage.setItem(KEYS.RUN_TOKEN, "1"); },
+    clearRunToken() { localStorage.removeItem(KEYS.RUN_TOKEN); },
 
-  function getTasks() {
-    try {
-      return JSON.parse(sessionStorage.getItem(TASK_KEY) || "[]");
-    } catch {
-      return [];
+    get isAutoRun() { return sessionStorage.getItem(KEYS.AUTO) === "1"; },
+    startAutoRun() { sessionStorage.setItem(KEYS.AUTO, "1"); },
+
+    initTasksFromInput(rawText) { // 初始化任务列表
+      const tasks = rawText.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+      sessionStorage.setItem(KEYS.TASK, JSON.stringify(tasks));
+      sessionStorage.setItem(KEYS.INDEX, "0");
+      sessionStorage.removeItem(KEYS.CUR);
+      sessionStorage.removeItem(KEYS.FAILED);
+      sessionStorage.removeItem(KEYS.LAST_SEARCHED);
+      sessionStorage.removeItem(KEYS.HAS_DOWNLOADED);
+      return tasks;
+    },
+
+    getTasks() { // 获取任务列表
+      try { return JSON.parse(sessionStorage.getItem(KEYS.TASK) || "[]"); }
+      catch { return []; }
+    },
+    getIndex() { // 获取当前任务索引
+      const n = parseInt(sessionStorage.getItem(KEYS.INDEX) || "0", 10);
+      return Number.isFinite(n) ? n : 0;
+    },
+    setIndex(i) { sessionStorage.setItem(KEYS.INDEX, String(i)); }, // 设置当前任务索引
+
+    getCurrentTarget() { // 获取当前任务
+      const cur = sessionStorage.getItem(KEYS.CUR);
+      if (cur) return cur;
+      const tasks = this.getTasks();
+      const t = tasks[this.getIndex()] || "";
+      if (t) sessionStorage.setItem(KEYS.CUR, t);
+      return t;
+    },
+
+    advanceToNextTask() { // 进入下一个任务
+      const tasks = this.getTasks();
+      const nextIdx = this.getIndex() + 1;
+      sessionStorage.removeItem(KEYS.CUR);
+      sessionStorage.removeItem(KEYS.HAS_DOWNLOADED);
+      this.setIndex(nextIdx);
+      return tasks[nextIdx] || null;
+    },
+
+    recordFail(t) { // 记录失败任务
+      let arr = JSON.parse(sessionStorage.getItem(KEYS.FAILED) || "[]");
+      if (!arr.includes(t)) arr.push(t);
+      sessionStorage.setItem(KEYS.FAILED, JSON.stringify(arr));
+    },
+
+    recordSuccess(t) { // 记录成功任务
+      let arr = JSON.parse(sessionStorage.getItem(KEYS.SUCCESS) || "[]");
+      if (!arr.includes(t)) arr.push(t);
+      sessionStorage.setItem(KEYS.SUCCESS, JSON.stringify(arr));
+    },
+
+    recordDownloaded() { sessionStorage.setItem(KEYS.HAS_DOWNLOADED, "1"); }, // 记录已下载
+    hasDownloaded() { return sessionStorage.getItem(KEYS.HAS_DOWNLOADED) === "1"; }, // 判断是否已下载
+
+    setListUrl(url) { sessionStorage.setItem(KEYS.LIST_URL, url); }, // 设置列表页URL
+    getListUrl() { return sessionStorage.getItem(KEYS.LIST_URL); }, // 获取列表页URL
+
+    // 页面跳转状态处理
+    getStage(stageKey) { return sessionStorage.getItem(stageKey); },
+    setStage(stageKey, val = "1") { sessionStorage.setItem(stageKey, val); },
+    clearStage(stageKey) { sessionStorage.removeItem(stageKey); },
+
+    stopAllAndCleanup(message) {
+      const success = JSON.parse(sessionStorage.getItem(KEYS.SUCCESS) || "[]");
+      const fails = JSON.parse(sessionStorage.getItem(KEYS.FAILED) || "[]");
+      const total = success.length + fails.length;
+
+      // 构建完整的结账报告
+      let report = message;
+      report += `\n\n📊 运行报告（共 ${total} 个任务）`;
+      if (success.length) report += `\n\n✅ 成功下载 (${success.length}):\n` + success.join("\n");
+      if (fails.length) report += `\n\n⚠️ 未找到 (${fails.length}):\n` + fails.join("\n");
+
+      // 清理除了 USER_TASKS 和 RUN_TOKEN 之外的所有状态
+      Object.values(KEYS).forEach(k => {
+        if (k !== KEYS.USER_TASKS && k !== KEYS.RUN_TOKEN) sessionStorage.removeItem(k);
+      });
+      // 单独清理 Token 停止运行
+      this.clearRunToken();
+
+      log("🛑 已停止：", report);
+      alert(report);
     }
-  }
+  };
 
-  function getIndex() {
-    const n = parseInt(sessionStorage.getItem(INDEX_KEY) || "0", 10);
-    return Number.isFinite(n) ? n : 0;
-  }
+  // ==========================================
+  // 3. 业务层 - 列表页逻辑 (List Page) 搜索并点击进入目标问卷
+  // ==========================================
+  const ListPage = {
+    isMatch() { return /myquestionnaires/i.test(location.href); }, // 判断是否是列表页
+    tryClickMatchedAction(maxTry = 10) { // 尝试点击搜索出的目标问卷并进入详情页的函数
+      const TARGET = Store.getCurrentTarget();
+      for (let i = 1; i <= maxTry; i++) {
+        const titleSel = i === 1
+          ? `#ctl01_ContentPlaceHolder1_qls > dl:nth-child(${i}) > dt > div.pull-left > a.pull-left.item-tit`
+          : `#ctl01_ContentPlaceHolder1_qls > dl:nth-child(${i}) > dt > div.pull-left > a`;
+        const actionSel = `#ctl01_ContentPlaceHolder1_qls > dl:nth-child(${i}) > dd > div.process-box.pull-left > dl.process-3.pull-left > dd > ul > li:nth-child(2) > a`;
+        const tEl = document.querySelector(titleSel);
+        const tText = Utils.normalizeString(tEl?.innerText);
 
-  function setIndex(i) {
-    sessionStorage.setItem(INDEX_KEY, String(i));
-  }
-
-  function getCurrentTarget() {
-    const cur = sessionStorage.getItem(CUR_KEY);
-    if (cur) return cur;
-
-    const tasks = getTasks();
-    const idx = getIndex();
-    const t = tasks[idx] || "";
-    if (t) sessionStorage.setItem(CUR_KEY, t);
-    return t;
-  }
-
-  function advanceToNextTask() {
-    const tasks = getTasks();
-    const idx = getIndex();
-    const nextIdx = idx + 1;
-    sessionStorage.removeItem(CUR_KEY);
-    sessionStorage.removeItem("wjx_has_downloaded");
-    setIndex(nextIdx);
-    return tasks[nextIdx] || null;
-  }
-
-  function stopAllAndCleanup(message) {
-    let fails = JSON.parse(sessionStorage.getItem(FAILED_KEY) || "[]");
-    if (fails.length) message += "\n\n⚠️ 未找到:\n" + fails.join("\n");
-
-    sessionStorage.removeItem(AUTO_KEY);
-    sessionStorage.removeItem(TASK_KEY);
-    sessionStorage.removeItem(INDEX_KEY);
-    sessionStorage.removeItem(CUR_KEY);
-    sessionStorage.removeItem(LIST_URL_KEY);
-    sessionStorage.removeItem(FAILED_KEY);
-    sessionStorage.removeItem("wjx_last_searched");
-    sessionStorage.removeItem("wjx_has_downloaded");
-
-    clearRunToken();
-
-    log("🛑 已停止：", message);
-    alert(message);
-  }
-
-  /***********************
-   * ✅ 搜索工具
-   ***********************/
-  function setNativeValue(el, value) {
-    const proto = Object.getPrototypeOf(el);
-    const desc = Object.getOwnPropertyDescriptor(proto, "value");
-    if (desc?.set) desc.set.call(el, value);
-    else el.value = value;
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-  }
-
-  /***********************
-   * ✅ 列表匹配 & 点击
-   ***********************/
-  function tryClickMatchedAction(maxTry = 10) {
-    const TARGET = getCurrentTarget();
-    log(`111`);
-    const titleSel = (i) =>
-      i === 1
-        ? `#ctl01_ContentPlaceHolder1_qls > dl:nth-child(${i}) > dt > div.pull-left > a.pull-left.item-tit`
-        : `#ctl01_ContentPlaceHolder1_qls > dl:nth-child(${i}) > dt > div.pull-left > a`;
-
-    const actionSel = (i) =>
-      `#ctl01_ContentPlaceHolder1_qls > dl:nth-child(${i}) > dd > div.process-box.pull-left > dl.process-3.pull-left > dd > ul > li:nth-child(2) > a`;
-
-    for (let i = 1; i <= maxTry; i++) {
-      const tEl = document.querySelector(titleSel(i));
-      const tText = normalize(tEl?.innerText);
-      log(`[check ${i}] title=`, tText);
-
-      if (tText && tText === normalize(TARGET)) {
-        const btn = document.querySelector(actionSel(i));
-        if (!btn) {
-          log(`✅ 匹配第 ${i} 条，但按钮没找到：`, actionSel(i));
-          return { matched: true, index: i, clicked: false, reason: "button_not_found" };
-        }
-
-        sessionStorage.setItem("wjx_need_last", "1");
-        try { btn.scrollIntoView({ block: "center" }); } catch { }
-        btn.click();
-        log(`✅ 匹配第 ${i} 条（${TARGET}），已点击按钮`);
-        return { matched: true, index: i, clicked: true };
-      }
-    }
-    log("❌ 前 10 条都未匹配");
-    return { matched: false };
-  }
-
-  /***********************
-   * ✅ 列表页自动化主流程
-   ***********************/
-  async function runListPageFlow() {
-    if (!hasRunToken()) return;
-    if (!sessionStorage.getItem(AUTO_KEY)) return;
-    if (window[RUNNING_KEY]) return;
-    window[RUNNING_KEY] = true;
-
-    try {
-      if (!sessionStorage.getItem(LIST_URL_KEY)) {
-        sessionStorage.setItem(LIST_URL_KEY, location.href);
-      }
-
-      const TARGET = getCurrentTarget();
-      const tasks = getTasks();
-      const idx = getIndex();
-
-      if (!TARGET) {
-        stopAllAndCleanup("✅ 已完成：所有 TASK 都已跑完，已自动停止。");
-        return;
-      }
-
-      log(`➡️ 当前任务 (${idx + 1}/${tasks.length})：`, TARGET);
-
-      const input =
-        document.querySelector('input[placeholder*="问卷名"]') ||
-        document.querySelector('input[placeholder*="搜索"]') ||
-        document.querySelector(".el-input__inner") ||
-        document.querySelector('input[type="text"]');
-
-      const SEARCH_FLAG = "wjx_last_searched";
-
-      if (input && sessionStorage.getItem(SEARCH_FLAG) !== TARGET) {
-        log(`🔎 准备检索问卷并等待结果：`, TARGET);
-        setNativeValue(input, TARGET);
-        sessionStorage.setItem(SEARCH_FLAG, TARGET);
-        await sleep(120);
-
-        if (window.btnSub && typeof window.btnSub.click === "function") {
-          window.btnSub.click();
-        } else {
-          document.querySelector("#ctl01_ContentPlaceHolder1_divInfo > i")?.click();
-        }
-
-        // 关键：点击搜索可能导致整个页面重载 (Postback)。
-        // 若没有重载而是 AJAX，则设置 1.5s 后重新调用检测函数。
-        // 若重载了，原脚本执行会自然终止，待新页面加载后再接管。
-        setTimeout(() => {
-          window[RUNNING_KEY] = false;
-          runListPageFlow();
-        }, 1500);
-        return; // 中断本轮执行回合
-      }
-
-      // 如果走到这里，说明要么已经搜过并在新页面载入了，要么输入框不存在
-      log("👀 正在检查搜索结果是否出现目标...");
-      const r = tryClickMatchedAction(10);
-
-      if (r?.matched && r?.clicked) {
-        return; // 匹配成功并点击，跳转成绩页逻辑
-      }
-
-      log("⚠️ 列表中未查找到该问卷或按钮点击失败，记录并跳过：", TARGET);
-      recordFail(TARGET);
-      const next = advanceToNextTask();
-      if (!next) {
-        stopAllAndCleanup("✅ 已完成：所有 TASK 都已跑完，已自动停止。");
-        return;
-      }
-
-      // 不管是 AJAX 还是啥，直接平滑衔接下一个问卷搜索
-      setTimeout(() => {
-        window[RUNNING_KEY] = false;
-        runListPageFlow();
-      }, 500);
-      return;
-    } finally {
-      window[RUNNING_KEY] = false;
-    }
-  }
-
-  /***********************
-   * ✅ 非列表页逻辑
-   ***********************/
-  if (!isListPage() && !hasRunToken()) return;
-
-  // 成绩页 - 阶段1 选最大条数
-  if (hasRunToken() && sessionStorage.getItem("wjx_need_last")) {
-    sessionStorage.removeItem("wjx_need_last");
-    sessionStorage.setItem("wjx_need_go_last", "1");
-
-    const ddl = document.querySelector("#ctl02_ContentPlaceHolder1_ViewStatSummary1_ddlPageCount");
-    if (ddl) {
-      ddl.click();
-      const opt = ddl.querySelector("option:nth-child(8)");
-      if (opt) {
-        opt.selected = true;
-        ddl.dispatchEvent(new Event("change", { bubbles: true }));
-        log("✅ 把每页显示问卷条数改为100");
-        return; // ✅ change事件会导致ASP.NET页面重载刷新，必须停止执行！
-      } else {
-        log("⚠️ 找不到100");
-      }
-    } else {
-      log("⚠️ 找不到clicker");
-    }
-    // 如果找不到下拉框/100项等，直接往下继续（容错）
-  }
-
-  // 成绩页 - 阶段1.5 跳到最后一页
-  if (hasRunToken() && sessionStorage.getItem("wjx_need_go_last")) {
-    sessionStorage.removeItem("wjx_need_go_last");
-    sessionStorage.setItem("wjx_need_detail", "1");
-    await sleep(3000);
-    try {
-      log("✅ 正在翻到最后一页...");
-      const f = document.forms[0];
-      if (!f || !f.__EVENTTARGET || !f.__EVENTARGUMENT) {
-        log("⚠️ 未找到表单隐藏字段，翻页可能失败");
-      } else {
-        f.__EVENTTARGET.value = "ctl02$ContentPlaceHolder1$ViewStatSummary1$btnLast";
-        f.__EVENTARGUMENT.value = "";
-        (f.requestSubmit ? f.requestSubmit() : f.submit());
-        return; // ✅ 提交表单会导致页面重载刷新！
-      }
-    } catch (e) {
-      log("⚠️ 翻页报错: ", e);
-    }
-    // 如果没能翻页（比如只有一页，去不掉 btnLast 或者报错），直接 fallthrough 往下走 阶段2
-  }
-
-
-
-  // 成绩页 - 阶段2 找最后一个是否是截止导出
-  if (hasRunToken() && sessionStorage.getItem("wjx_need_detail")) {
-    sessionStorage.removeItem("wjx_need_detail");
-    const p = new Promise((resolve) => {
-      const STOP_TEXT = "截止导出";
-      const TABLE = "#ctl02_ContentPlaceHolder1_ViewStatSummary1_tbSummary > tbody";
-      const normalize2 = (s) => (s ?? "").replace(/\u3000/g, " ").replace(/\s+/g, " ").trim();
-
-      const isClickable = (el) => {
-        if (!el) return false;
-        const a = el.tagName?.toLowerCase() === "a" ? el : el.querySelector?.("a");
-        const target = a || el;
-        if (target.hasAttribute?.("disabled")) return false;
-        if (target.getAttribute?.("aria-disabled") === "true") return false;
-        const cs = window.getComputedStyle(target);
-        if (cs.pointerEvents === "none") return false;
-        if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") return false;
-        return true;
-      };
-
-      const getClickableValueAtRow = (i) => {
-        const tdSel = `${TABLE} > tr:nth-child(${i}) > td:nth-child(6)`;
-        const td = document.querySelector(tdSel);
-        if (!td) return null;
-        const a = td.querySelector("a") || td;
-        if (!isClickable(a)) return null;
-        return { row: i, tdSel, el: a, text: normalize2(a.innerText || td.innerText) };
-      };
-
-      const processRow = (i) => {
-        if (i < 1) { resolve(false); return; }
-
-        const hit = getClickableValueAtRow(i);
-        if (!hit) { processRow(i - 1); return; }
-
-        log(`✅ 第${i}行可点击：`, hit.text);
-        const ok = normalize2(hit.text) === normalize2(STOP_TEXT);
-
-        if (ok) {
-          const hasDownloaded = sessionStorage.getItem("wjx_has_downloaded") === "1";
-          if (hasDownloaded) {
-            log(`匹配到截止导出，但在之前已经有过新下载，在新标签页记录当前页面...`);
-            window.open(location.href + "#static", "_blank");
-          } else {
-            log(`第一次直接匹配到截止导出，跳过新标签页打开`);
+        if (tText && tText === Utils.normalizeString(TARGET)) {
+          const btn = document.querySelector(actionSel);
+          if (!btn) {
+            log(`⚠️ 匹配第 ${i} 条，但按钮没找到：`, actionSel);
+            return { matched: true, clicked: false };
           }
-          resolve(true);
+          // 进入详情页前注入状态
+          Store.setStage(KEYS.NEED_100);
+          try { btn.scrollIntoView({ block: "center" }); } catch { }
+          btn.click();
+          log(`✅ 匹配第 ${i} 条（${TARGET}），已点击按钮`);
+          return { matched: true, clicked: true };
+        }
+      }
+      log("⚠️ 前 10 条都未匹配");
+      return { matched: false };
+    },
+
+    async run() { //实际程序运行逻辑
+      if (!Store.hasRunToken || !Store.isAutoRun) return;
+      if (window.__wjx_multi_running) return;
+      window.__wjx_multi_running = true;
+
+      try {
+        if (!Store.getListUrl()) Store.setListUrl(location.href); // 设置当前URL
+        const TARGET = Store.getCurrentTarget(); // 获取当前任务问卷
+        if (!TARGET) {
+          Store.stopAllAndCleanup("✅ 已完成：所有 TASK 都已跑完，已自动停止。");
           return;
         }
-        sessionStorage.setItem("wjx_has_downloaded", "1");
+        // 搜索问卷
+        const input = document.querySelector('input[placeholder*="问卷名"], input[placeholder*="搜索"], .el-input__inner, input[type="text"]');
+        if (input && sessionStorage.getItem(KEYS.LAST_SEARCHED) !== TARGET) {
+          Utils.setNativeValue(input, TARGET); // 输入问卷名
+          sessionStorage.setItem(KEYS.LAST_SEARCHED, TARGET); // 记录已搜索
+          await sleep(120); // 等待搜索结果
+          document.querySelector("#ctl01_ContentPlaceHolder1_divInfo > i")?.click(); // 点击搜索按钮
+          setTimeout(() => { window.__wjx_multi_running = false; this.run(); }, 1500);
+          return;
+        }
+        const r = this.tryClickMatchedAction(10); // 尝试点击匹配的问卷
+        if (r?.matched && r?.clicked) return; // 如果匹配并点击了，就返回
+        else {
+          log("⚠️ 列表中未查找到该问卷或按钮点击失败，记录并跳过：", TARGET);
+          Store.recordFail(TARGET);
+        }
+        const next = Store.advanceToNextTask(); // 进入下一个任务
+        if (!next) {
+          Store.stopAllAndCleanup("✅ 已完成：所有 TASK 都已跑完，已自动停止。");
+          return;
+        }
+        setTimeout(() => { window.__wjx_multi_running = false; this.run(); }, 500);
+      } finally {
+        window.__wjx_multi_running = false;
+      }
+    }
+  };
 
-        // else：点击详情 → 等弹窗 iframe 加载完 → 注入下载 → 等待 → 关闭弹窗 → 处理 i-1
-        log(hit.text, STOP_TEXT);
-        const clickSel = `#ctl02_ContentPlaceHolder1_ViewStatSummary1_tbSummary > tbody > tr:nth-child(${i}) > td:nth-child(4) > a.see.active`;
-        const a = document.querySelector(clickSel);
-        if (a) {
+  // ==========================================
+  // 4. 业务层 - 成绩明细页逻辑 (Detail Page) 搜索所有符合条件的问卷并下载
+  // ==========================================
+  const DetailPage = {
+    isClickable(el) { // 判断元素是否可以点击的函数
+      if (!el) return false;
+      const target = el.tagName?.toLowerCase() === "a" ? el : (el.querySelector?.("a") || el);
+      if (target.hasAttribute?.("disabled") || target.getAttribute?.("aria-disabled") === "true") return false;
+      const cs = window.getComputedStyle(target);
+      if (cs.pointerEvents === "none" || cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") return false;
+      return true;
+    },
+
+    async setPageSize100() { // 设置每页显示100条的函数
+      Store.clearStage(KEYS.NEED_100);
+      Store.setStage(KEYS.NEED_LAST_PAGE);
+      const pageSizeSelect = document.querySelector("#ctl02_ContentPlaceHolder1_ViewStatSummary1_ddlPageCount");
+      if (pageSizeSelect) {
+        pageSizeSelect.click();
+        const option100 = pageSizeSelect.querySelector("option:nth-child(8)"); // 100条
+        if (option100) {
+          option100.selected = true;
+          pageSizeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+          log("✅ 把每页显示问卷条数改为100");
+          return true;
+        }
+      }
+      log("⚠️ 把每页显示问卷条数改为100失败");
+      return false;
+    },
+
+    async goToLastPage() { // 翻到最后一页的函数
+      Store.clearStage(KEYS.NEED_LAST_PAGE);
+      Store.setStage(KEYS.NEED_DOWNLOAD);
+      await sleep(3000);
+      try {
+        log("✅ 正在翻到最后一页...");
+        const f = document.forms[0];
+        if (f && f.__EVENTTARGET && f.__EVENTARGUMENT) {
+          f.__EVENTTARGET.value = "ctl02$ContentPlaceHolder1$ViewStatSummary1$btnLast";
+          f.__EVENTARGUMENT.value = "";
+          (f.requestSubmit ? f.requestSubmit() : f.submit());
+          return true;
+        }
+      } catch (e) { log("⚠️ 翻页报错: ", e); }
+      log("⚠️ 翻到最后一页失败（如果只有一页则忽略）");
+      return false;
+    },
+
+    injectIframeDownload(rowNum, processRowFn) { // 注入iframe并下载的函数
+      setTimeout(() => {
+        let popupIframe = null;
+        let layerEl = null;
+        document.querySelectorAll("[id^='layui-layer']").forEach(el => {
+          const iframe = el.querySelector("iframe");
+          if (iframe) { popupIframe = iframe; layerEl = el; }
+        });
+
+        // inject进入iframe，下载问卷
+        const doInject = (targetDocument) => {
+          const s = targetDocument.createElement("script");
+          s.src = chrome.runtime.getURL("inject.js");
+          s.onload = function () { this.remove(); };
+          (targetDocument.head || targetDocument.documentElement).appendChild(s);
+        };
+        const doInjectWithClose = (iframeDoc, layerElement) => {
+          log(`✅ iframe load事件触发, 开始注射`);
+          let doc = iframeDoc;
           try {
-            const href = a.getAttribute && (a.getAttribute("href") || "");
-            if (href && href.trim().toLowerCase().startsWith("javascript:")) {
-              a.removeAttribute("href");
-            }
-          } catch (e) { }
-          a.click();
-          log(`已点击第 ${i} 行查看详情`);
-        } else {
-          log(`第 ${i} 行未找到 a.see.active`);
+            const test = doc.location;
+          } catch (e) {
+            log(`⚠️ 跨域或读取失败, 回退：注射到主页面`);
+            doc = document;
+          }
+          doInject(doc);
+          // 保持你原本的 3500 毫秒延时
+          setTimeout(() => {
+            if (layerElement) layerElement.querySelector("span > a")?.click();
+            log(`关闭弹窗, 继续处理...`);
+            setTimeout(() => processRowFn(rowNum - 1), 500);
+          }, 3500);
+        };
+
+        if (!popupIframe) {
+          log(`⚠️ 等待 500ms 后依然未找到弹窗，强制脱壳处理`);
+          doInjectWithClose(document, null);
+          return;
         }
 
-        // ✅ 修复：用 load 事件（而非 readyState 轮询）等 iframe 加载完毕
-        // readyState 轮询会读到上一次关闭弹窗后遗留的旧 document（它仍是 "complete"），
-        // 导致 inject.js 被注射进即将被导航替换的旧文档，5秒后静默消失。
-        // load 事件只在 iframe 真正加载完新 URL 后触发，不会被旧状态欺骗。
-        // 给 Layui 500ms 时间创建/复用 iframe 并开始加载新 URL
-        // （这段时间内 iframe 从旧 "complete" 变成新 "loading"，load 事件尚未触发）
-        setTimeout(() => {
-          let popupIframe = null;
-          let layerEl = null;
-          document.querySelectorAll("[id^='layui-layer']").forEach(el => {
-            const iframe = el.querySelector("iframe");
-            if (iframe) { popupIframe = iframe; layerEl = el; }
-          });
+        // 15秒兜底超时，防止 iframe 永远不触发 load 导致脚本彻底卡死在这个 i 上
+        const fallbackTimer = setTimeout(() => {
+          log(`⚠️ iframe load 事件超时，降级执行主页面注射`);
+          doInjectWithClose(document, layerEl);
+        }, 15000);
 
-          const doInject = (capturedIframe, capturedLayer) => {
-            log(`✅ iframe load事件触发（layer=${capturedLayer?.id}），开始注射 inject.js`);
-            try {
-              const s = capturedIframe.contentDocument.createElement("script");
-              s.src = chrome.runtime.getURL("inject.js");
-              s.onload = function () { this.remove(); };
-              (capturedIframe.contentDocument.head || capturedIframe.contentDocument.documentElement).appendChild(s);
-            } catch (e) {
-              log(`⚠️ 注射进 iframe 失败，回退：注射到主页面`);
-              const s = document.createElement("script");
-              s.src = chrome.runtime.getURL("inject.js");
-              s.onload = function () { this.remove(); };
-              (document.head || document.documentElement).appendChild(s);
+        // 完美主线：直接监听弹窗的加载完成
+        popupIframe.addEventListener("load", () => {
+          clearTimeout(fallbackTimer);
+          doInjectWithClose(popupIframe.contentDocument, layerEl);
+        }, { once: true });
+      }, 500);
+    },
+
+    async processDetails() { // 处理详情页的函数,判断截止导出条件
+      Store.clearStage(KEYS.NEED_DOWNLOAD);
+
+      const foundCutoff = await new Promise((resolve) => { // 找到截止导出条件
+        const processRow = (i) => {
+          if (i < 1) { resolve(false); return; }
+          const tdSel = `#ctl02_ContentPlaceHolder1_ViewStatSummary1_tbSummary > tbody > tr:nth-child(${i}) > td:nth-child(6)`;
+          const td = document.querySelector(tdSel);
+          if (!td || !this.isClickable(td)) { processRow(i - 1); return; }
+          const text = Utils.normalizeString(td.innerText);
+          log(`✅ 第${i}行可点击：`, text);
+          if (text === "截止导出") {// 遇到截止点
+            if (Store.hasDownloaded()) {
+              log(`匹配到截止导出，当前问卷也已经有下载触发过，在新标签页记录当前页面，以便后续手动添加截止导出`);
+              window.open(location.href + "#static", "_blank");
             }
-            // 留 3.5s 后关弹窗 (防止因数据量大、服务器生成文件慢导致下载被中断)
-            setTimeout(() => {
-              capturedLayer?.querySelector("span > a")?.click();
-              log(`关闭弹窗（${capturedLayer?.id}），继续处理第 ${i - 1} 行`);
-              // 关弹窗后，只需缓冲 0.5s 便可处理下一条
-              setTimeout(() => processRow(i - 1), 500);
-            }, 3500);
-          };
-
-          if (!popupIframe) {
-            log(`⚠️仍找不到弹窗 iframe，回退：注射到主页面`);
-            const s = document.createElement("script");
-            s.src = chrome.runtime.getURL("inject.js");
-            s.onload = function () { this.remove(); };
-            (document.head || document.documentElement).appendChild(s);
-            setTimeout(() => {
-              log(`关闭弹窗（未知），继续处理第 ${i - 1} 行`);
-              setTimeout(() => processRow(i - 1), 500);
-            }, 3500);
+            resolve(true);
             return;
           }
+          // 如果当前行不是截止导出，则记录已下载，并点击查看详情
+          Store.recordDownloaded();
+          const clickSel = `#ctl02_ContentPlaceHolder1_ViewStatSummary1_tbSummary > tbody > tr:nth-child(${i}) > td:nth-child(4) > a.see.active`;
+          const clickEl = document.querySelector(clickSel);
+          if (clickEl) {
+            try { if (clickEl.getAttribute("href")?.trim().toLowerCase().startsWith("javascript:")) clickEl.removeAttribute("href"); } catch (e) { }
+            clickEl.click();
+            log(`已点击第 ${i} 行查看详情`);
+          }
+          this.injectIframeDownload(i, processRow); // 注入iframe并下载
+        };
+        setTimeout(() => processRow(100), 600);
+      });
+      await sleep(2000); // 等待下载完成
 
-          log(`已找到弹窗 iframe（${layerEl?.id}），等待 load 事件...`);
-          const capturedIframe = popupIframe;
-          const capturedLayer = layerEl;
-
-          // 超时兜底：20s 内没有 load 事件就回退
-          const fallbackTimer = setTimeout(() => {
-            log(`⚠️ 等待 load 事件超时 20s，回退：注射到主页面`);
-            const s = document.createElement("script");
-            s.src = chrome.runtime.getURL("inject.js");
-            s.onload = function () { this.remove(); };
-            (document.head || document.documentElement).appendChild(s);
-            setTimeout(() => {
-              capturedLayer?.querySelector("span > a")?.click();
-              log(`关闭弹窗（${capturedLayer?.id || "未知"}），继续处理第 ${i - 1} 行`);
-              setTimeout(() => processRow(i - 1), 500);
-            }, 3500);
-          }, 20000);
-
-          // 监听 load 事件（{once:true} 确保只触发一次）
-          capturedIframe.addEventListener("load", () => {
-            clearTimeout(fallbackTimer);
-            doInject(capturedIframe, capturedLayer);
-          }, { once: true });
-
-        }, 500); // 给 Layui 500ms 启动 iframe 导航
-      };
-      setTimeout(() => processRow(100), 600);
-    });
-
-    return p.then((foundCutoff) => new Promise(r => setTimeout(() => r(foundCutoff), 2000))).then((foundCutoff) => {
+      // 处理第二页
       const lbPage = document.getElementById("ctl02_ContentPlaceHolder1_ViewStatSummary1_lbPage");
       const isPage2 = lbPage && lbPage.textContent.trim() === "2/2";
 
       if (!foundCutoff && isPage2) {
-        log("✅ 当前页(第2页)未找到[截止导出]，准备返回第1页继续...");
+        log("✅ 当前页(第2页)未找到截止导出, 准备返回第1页继续");
         const f = document.forms[0];
         if (f && f.__EVENTTARGET && f.__EVENTARGUMENT) {
-          // 当前任务还没找完所有页！把阶段2标记传下去。当页面刷新（回到第一页）后，会自动继续本任务的扫尾
-          sessionStorage.setItem("wjx_need_detail", "1");
+          Store.setStage(KEYS.NEED_DOWNLOAD);
           f.__EVENTTARGET.value = "ctl02$ContentPlaceHolder1$ViewStatSummary1$btnFirst";
           f.__EVENTARGUMENT.value = "";
           (f.requestSubmit ? f.requestSubmit() : f.submit());
@@ -517,121 +395,102 @@ console.log(
         }
       }
 
-      // 无论是在哪一页，如果最终【没有】遇到截止导出，但是这个过程中发生了【下载】行为
-      // 说明它把所有新记录都下完了，准备切任务前，应当补开一个新标签页
-      log(`[DEBUG] 进入收尾阶段。foundCutoff: ${foundCutoff}, isPage2: ${isPage2}`);
-      if (!foundCutoff) {
-        const rawHasDownloaded = sessionStorage.getItem("wjx_has_downloaded");
-        const hasDownloaded = rawHasDownloaded === "1";
-        log(`[DEBUG] 因为没有中途被截断(!foundCutoff)，检查是否有下载行为: wjx_has_downloaded=${rawHasDownloaded}`);
-        if (hasDownloaded) {
-          log(`🔥 数据已全部下完（未遇到截止导出），作为存底在新标签页记录当前页面...`);
-          window.open(location.href + "#static", "_blank");
-        } else {
-          log(`[DEBUG] ❌ 取消补开新页面：因为本次任务压根没有任何新数据被点击下载。`);
-        }
-      } else {
-        log(`[DEBUG] ❌ 取消补开新页面：因为找到了 cutoff（这说明中途碰到了红线，已经在遇到红线时处理过新标签页了）。`);
+      // 未遇到截止导出
+      if (!foundCutoff && Store.hasDownloaded()) {
+        log(`✅ 数据已全部下完，未遇到截止导出，在新标签页记录当前页面`);
+        window.open(location.href + "#static", "_blank");
       }
 
-      // 如果走到了这里说明该任务彻底完成：要么在第2页找到了截止导出；要么两页全部下载完了（没中截止导出）
-      const next = advanceToNextTask();
+      // 记录当前任务成功，切换下一个
+      const currentTarget = Store.getCurrentTarget();
+      if (currentTarget) Store.recordSuccess(currentTarget);
+
+      const next = Store.advanceToNextTask();
       if (!next) {
-        stopAllAndCleanup("✅ 已完成：所有 TASK 都已跑完，已自动停止。");
+        Store.stopAllAndCleanup("✅ 已完成：所有 TASK 都已跑完，已自动停止");
         return;
       }
-      const listUrl = sessionStorage.getItem(LIST_URL_KEY);
+
+      const listUrl = Store.getListUrl();
       if (listUrl) {
-        log("↩️ 回到列表页：", next);
+        log("✅ 回到主页面，进行下一个任务");
         location.href = listUrl;
       } else {
-        stopAllAndCleanup("⚠️ 未记录列表页 URL");
+        Store.stopAllAndCleanup("⚠️ 未记录主页面 URL");
       }
-    });
-  }
+    },
 
-  /***********************
-   * ✅ 注入面板（Panel）逻辑
-   ***********************/
-  function injectControlPanel() {
-    if (!isListPage()) return;
-    const PANEL_ID = "wjx-helper-panel";
-    if (document.getElementById(PANEL_ID)) return;
-
-    // 1. 创建容器
-    const panel = document.createElement("div");
-    panel.id = PANEL_ID;
-    panel.style.cssText =
-      "position:fixed;left:16px;bottom:16px;z-index:999999;" +
-      "padding:12px;border-radius:8px;background:#fff;" +
-      "box-shadow:0 4px 12px rgba(0,0,0,0.2);border:1px solid #ddd;" +
-      "display:flex;flex-direction:column;gap:8px;width:200px;";
-
-    // 2. 标题
-    const header = document.createElement("div");
-    header.textContent = "问卷星助手 - 任务列表";
-    header.style.cssText = "font-weight:bold;font-size:14px;color:#333;";
-    panel.appendChild(header);
-
-    // 3. 输入框 (Textarea)
-    const textarea = document.createElement("textarea");
-    textarea.placeholder = "一行一个编号\n例如：\nPB-17\nPB-18";
-    textarea.style.cssText =
-      "width:100%;height:120px;box-sizing:border-box;resize:vertical;" +
-      "border:1px solid #ccc;border-radius:4px;padding:6px;font-family:monospace;";
-
-    // 自动回填上次保存的内容
-    const saved = localStorage.getItem(USER_TASKS_KEY);
-    if (saved) textarea.value = saved;
-    // 如果没有存过，给个默认例子（可选，或者留空）
-    else textarea.value = "PB-17\nPB-17-课后";
-
-    panel.appendChild(textarea);
-
-    // 4. “开始任务”按钮
-    const btn = document.createElement("button");
-    btn.textContent = "保存并开始全部任务";
-    btn.style.cssText =
-      "padding:8px;background:#f00;color:#fff;border:none;border-radius:4px;" +
-      "cursor:pointer;font-weight:bold;";
-
-    btn.onclick = () => {
-      const raw = textarea.value;
-      if (!raw.trim()) {
-        alert("请输入至少一个任务编号！");
-        return;
+    async run() { // 运行函数
+      if (!Store.hasRunToken) return;
+      // 这里的 if 控制了成绩页内串行的加载链路 (通过自动重载推进)
+      if (Store.getStage(KEYS.NEED_100)) {
+        const reloaded = await this.setPageSize100();
+        if (reloaded) return;
       }
+      if (Store.getStage(KEYS.NEED_LAST_PAGE)) {
+        const reloaded = await this.goToLastPage();
+        if (reloaded) return;
+      }
+      if (Store.getStage(KEYS.NEED_DOWNLOAD)) {
+        await this.processDetails();
+      }
+    }
+  };
 
-      // 保存到 localStorage
-      localStorage.setItem(USER_TASKS_KEY, raw);
+  // ==========================================
+  // 5. UI 控制面板 (Panel)
+  // ==========================================
+  const UI = {
+    inject() {
+      if (!ListPage.isMatch()) return;
+      const PANEL_ID = "wjx-helper-panel";
+      if (document.getElementById(PANEL_ID)) return;
+      const panel = document.createElement("div");
+      panel.id = PANEL_ID;
+      panel.style.cssText = "position:fixed;left:16px;bottom:16px;z-index:999999;padding:12px;border-radius:8px;background:#fff;box-shadow:0 4px 12px rgba(0,0,0,0.2);border:1px solid #ddd;display:flex;flex-direction:column;gap:8px;width:200px;";
+      const header = document.createElement("div");
+      header.textContent = "问卷星助手 - 任务列表";
+      header.style.cssText = "font-weight:bold;font-size:14px;color:#333;";
+      panel.appendChild(header);
+      const textarea = document.createElement("textarea");
+      textarea.placeholder = "一行一个编号\n例如：\nPB-17\nPB-18";
+      textarea.style.cssText = "width:100%;height:120px;box-sizing:border-box;resize:vertical;border:1px solid #ccc;border-radius:4px;padding:6px;font-family:monospace;";
+      textarea.value = localStorage.getItem(KEYS.USER_TASKS) || "PB-17\nPB-17-课后";
+      panel.appendChild(textarea);
+      const btn = document.createElement("button");
+      btn.textContent = "保存并开始全部任务";
+      btn.style.cssText = "padding:8px;background:#f00;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:bold;";
+      btn.onclick = () => {
+        const raw = textarea.value;
+        if (!raw.trim()) return alert("请输入至少一个任务编号！");
+        localStorage.setItem(KEYS.USER_TASKS, raw);
+        Store.setRunToken();
+        const tasks = Store.initTasksFromInput(raw);
+        log(`✅ 面板启动，共 ${tasks.length} 个任务：`, tasks);
+        Store.startAutoRun();
+        Store.setListUrl(location.href);
+        ListPage.run();
+      };
+      panel.appendChild(btn);
+      document.documentElement.appendChild(panel);
+      log("✅ 已注入控制面板");
+    }
+  };
 
-      // 授权
-      setRunToken();
-
-      // 初始化任务队列
-      const tasks = initTasksFromInput(raw);
-
-      log(`✅ 面板启动，共 ${tasks.length} 个任务：`, tasks);
-
-      sessionStorage.setItem(AUTO_KEY, "1");
-      sessionStorage.setItem(LIST_URL_KEY, location.href);
-
-      runListPageFlow();
-    };
-
-    panel.appendChild(btn);
-    document.documentElement.appendChild(panel);
-    log("✅ 已注入控制面板");
-  }
-
-  // 启动逻辑
+  // ==========================================
+  // 6. 主程序入口 (Main)
+  // ==========================================
+  const start = () => {
+    UI.inject(); // 只在列表页面生效
+    if (ListPage.isMatch()) {
+      ListPage.run();
+    } else {
+      DetailPage.run();
+    }
+  };
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => {
-      injectControlPanel();
-      runListPageFlow();
-    });
+    document.addEventListener("DOMContentLoaded", start);
   } else {
-    injectControlPanel();
-    runListPageFlow();
+    start();
   }
 })();

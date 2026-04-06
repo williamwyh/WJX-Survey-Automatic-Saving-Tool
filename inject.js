@@ -1,7 +1,4 @@
 // 运行在 Main World，拥有完全的 DOM 访问权限，不受 CSP 限制
-// 支持两种场景：
-//   场景A: 被注射进弹窗 iframe 自身（content.js 新逻辑）→ 用 window.frames[0] 找子 iframe
-//   场景B: 被注射进主页面（旧逻辑兜底）→ 用 top.frames[1].frames[0] 穿透
 (() => {
   const tryClick = (el) => {
     if (!el) return false;
@@ -13,47 +10,29 @@
     return true;
   };
 
-  // 在指定 doc 里找按钮并点击，返回是否成功
-  const findAndClick = (doc, label) => {
+  const findAndClick = (doc) => {
     try {
       const el = doc?.querySelector("#hrefSavecatReport");
       if (el) {
         const ok = tryClick(el);
-        console.log(`Helper: [${label}] 找到按钮，已点击:`, ok);
+        console.log(`✅ Helper: 找到按钮，已点击，开始下载:`, ok);
         return true;
       }
     } catch (e) {
-      console.warn(`Helper: [${label}] 访问 document 出错:`, e);
+      console.warn(`⚠️ Helper: 访问出错，没有下载:`, e);
     }
     return false;
   };
 
   setTimeout(() => {
-    // ① 当前 document 直接找（按钮就在弹窗 iframe 的顶层 document 里）
-    if (findAndClick(document, "当前document")) return;
+    // ① 直接找（注入点如果精准命中，这步直接秒杀）
+    if (findAndClick(document)) return;
 
-    // ② 当前 window 的子 frames（按钮在弹窗 iframe 内嵌的子 iframe 里）
-    //    这是最关键的路径：inject.js 在 layui-layerN 里运行时，
-    //    window.frames[0] 就是它自己内部的子 iframe，
-    //    不会因为多个弹窗并存而索引错位
+    // ② 往下探一层框（如果是挂载在主页面，透过主页面的子 iframe 寻找）
     for (let i = 0; i < window.frames.length; i++) {
-      if (findAndClick(window.frames[i]?.document, `子frame[${i}]`)) return;
+      if (findAndClick(window.frames[i]?.document)) return;
     }
 
-    // ③ 最终兜底：从 top 往下穿透（inject.js 在主页面时走这里）
-    //    注意：多个弹窗并存时 top.frames 的索引可能不稳定
-    console.warn("Helper: ①②未找到，尝试 top.frames 兜底...");
-    try {
-      for (let j = 0; j < top.frames.length; j++) {
-        try {
-          for (let k = 0; k < top.frames[j].frames.length; k++) {
-            if (findAndClick(top.frames[j].frames[k]?.document, `top.frames[${j}].frames[${k}]`)) return;
-          }
-        } catch (e) { /* 跨域或不可访问，跳过 */ }
-      }
-      console.warn("Helper: 所有路径均未找到 #hrefSavecatReport");
-    } catch (e) {
-      console.error("Helper: 下载点击失败:", e);
-    }
-  }, 500); // 给弹窗页面 500ms 时间完全渲染
+    console.warn("⚠️ Helper: 下载失败，未找到 #hrefSavecatReport");
+  }, 500);
 })();
